@@ -3,7 +3,7 @@
 // 注意：全文只用 let，不要用 const。AutoX 的 Rhino 引擎里，循环体内的 const 只会赋值一次，
 // 之后每轮都保留第一次的值（实测：每个直播间都记成第一个用户名、找卡片一直超时）
 // 版本号：热更新加载器靠这个标记判断下载内容是否有效，悬浮窗也会显示。每次推送加 0.1
-let SCRIPT_VERSION = "1.0";
+let SCRIPT_VERSION = "1.0-test";
 
 auto.waitFor();
 
