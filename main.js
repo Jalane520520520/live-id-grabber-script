@@ -3,7 +3,7 @@
 // 注意：全文只用 let，不要用 const。AutoX 的 Rhino 引擎里，循环体内的 const 只会赋值一次，
 // 之后每轮都保留第一次的值（实测：每个直播间都记成第一个用户名、找卡片一直超时）
 // 版本号：热更新加载器靠这个标记判断下载内容是否有效，悬浮窗也会显示。每次推送加 0.1
-let SCRIPT_VERSION = "1.0";
+let SCRIPT_VERSION = "1.1";
 
 auto.waitFor();
 
@@ -19,6 +19,9 @@ let CFG = {
   },
   userRe: /^@?[A-Za-z0-9_.]{2,24}$/,           // 用户名格式
   cardMarkerRe: /^(\+?\s?关注|已关注|回关|Follow|Following|Follow back|Friends|Theo dõi|Đang theo dõi)$/, // 备用：卡片底部按钮文字
+  headerMarkerRe: /^\+?\s?(关注|已关注|回关|Follow|Following|Follow back|Friends|Theo dõi|Đang theo dõi)/, // 通用识别：主播条里的“关注”按钮（文字或 desc 以此开头）
+  idFailLimit: 3,                              // ID 识别连续失败几次后切到通用识别
+  retryIdEvery: 20,                            // 通用模式下每隔多少个直播间再试一次 ID
   errorRe: /^(Retry|Network error|重试|网络错误|Thử lại|Lỗi mạng)$/, // 卡片加载失败时的文字
   avatarFallback:[0.088, 0.038],              // 找不到主播条时点击的比例坐标
   liveEntryFallback: [0.087, 0.073],           // 首页左上角 LIVE 入口的比例坐标
@@ -33,7 +36,7 @@ let CFG = {
   lockFile: "/sdcard/Download/grabber.lock",   // 单实例锁
   autostartFlag: "/sdcard/Download/grabber_autostart", // 调试用：存在此文件则启动即运行，不用点悬浮窗
   maxRelaunch: 3,                              // 连续拉回失败几次后暂停
-  maxMissStreak: 8,                            // 连续这么多次不在直播间，就重新导航进 LIVE
+  maxMissStreak: 4,                            // 连续这么多次不在直播间，就重新导航进 LIVE
 };
 // ========================================
 
@@ -83,6 +86,111 @@ function roomHeader(timeout) {
   return h;
 }
 
+// ---------------- 通用识别（不依赖控件 ID，也不依赖界面语言） ----------------
+// ID 识别连续失败（TikTok 更新把控件 ID 改了）时自动启用，靠位置和文字结构找：
+//   直播间 = 屏幕左上区域有一个带“关注”按钮的可点击主播条；
+//   卡片   = 点击后新出现的、文字等于主播昵称的节点；用户名 = 昵称正下方符合用户名格式的那一行。
+let idMode = true, idFails = 0, genRooms = 0;
+let keyOf = (n) => (n.text() || "") + "@" + n.bounds().toString();
+let isCountText = (t) => /^[0-9][0-9.,]*\s?[KkMmBb万]?$/.test(t);
+
+function genericHeader(timeout) {
+  let end = Date.now() + (timeout || 1500);
+  do {
+    let cands = clickable(true).boundsInside(0, 0, Math.round(W * 0.8), Math.round(H * 0.16)).find().filter((n) => {
+      let b = n.bounds();
+      if (!(b.left < W * 0.1 && b.width() > W * 0.25 && b.height() >= 70 && b.height() <= 230)) return false;
+      if (!onScreen(n)) return false;
+      let marks = textMatches(CFG.headerMarkerRe).find().concat(descMatches(CFG.headerMarkerRe).find());
+      return marks.some((m) => { let mb = m.bounds(); return mb.centerX() >= b.left && mb.centerX() <= b.right && mb.centerY() >= b.top && mb.centerY() <= b.bottom; });
+    });
+    if (cands.length) {
+      cands.sort((a, b) => a.bounds().left - b.bounds().left || b.bounds().width() - a.bounds().width());
+      return cands[0];
+    }
+    sleep(500);
+  } while (Date.now() < end);
+  return null;
+}
+
+// 主播条里的昵称：第一个不是“关注”、不是数字的文字；没有就退回 desc 里“昵称,点赞数”的前半
+function headerNick(h) {
+  let hb = h.bounds();
+  let ts = textMatches(/.+/).boundsInside(hb.left, hb.top, hb.right, hb.bottom).find().filter((n) => {
+    let t = (n.text() || "").trim();
+    return t && !CFG.headerMarkerRe.test(t) && !isCountText(t);
+  });
+  ts.sort((a, b) => a.bounds().top - b.bounds().top || a.bounds().left - b.bounds().left);
+  if (ts.length) return (ts[0].text() || "").trim();
+  return (h.desc() || "").replace(/,[^,]*$/, "").trim();
+}
+
+let anyHeader = (timeout) => (idMode ? roomHeader(timeout) : genericHeader(timeout));
+
+function textKeys() {
+  let st = new Set();
+  textMatches(/.+/).find().forEach((n) => { st.add(keyOf(n)); });
+  return st;
+}
+
+// 等卡片：找新出现的、文字等于昵称的节点（在主播条下方，靠右，避开评论区那一列），再取它正下方的用户名
+function waitGenericCard(nick, hb, before, timeout) {
+  let end = Date.now() + timeout;
+  do {
+    let nicks = text(nick).find().filter((n) => {
+      if (!onScreen(n)) return false;
+      let b = n.bounds();
+      return b.top > hb.bottom + 40 && b.left > W * 0.2 && !before.has(keyOf(n));
+    });
+    nicks.sort((a, b) => a.bounds().top - b.bounds().top);
+    for (let i = 0; i < nicks.length; i++) {
+      let nb = nicks[i].bounds();
+      let us = textMatches(CFG.userRe).find().filter((n) => {
+        if (!onScreen(n)) return false;
+        let b = n.bounds();
+        return Math.abs(b.left - nb.left) < 40 && b.top >= nb.bottom - 20 && b.top - nb.bottom < 160;
+      });
+      if (us.length) return (us[0].text() || "").trim();
+    }
+    sleep(500);
+  } while (Date.now() < end);
+  return null;
+}
+
+function closeCardGeneric(nick) {
+  back();
+  sleep(random(700, 1000));
+  if (genericHeader(2500)) return;
+  let still = nick
+    ? text(nick).find().filter((n) => onScreen(n) && n.bounds().left > W * 0.2 && n.bounds().top > H * 0.15)[0]
+    : findVisible(textMatches(CFG.errorRe), 300);
+  if (still) {
+    log("卡片没关掉，再按一次返回");
+    back();
+    sleep(1000);
+  }
+}
+
+// 通用版的 grabOne：返回 {id, nick} 或 {skip: 原因}
+function grabOneGeneric() {
+  if (!genericHeader(1000) && findVisible(textMatches(CFG.errorRe), 300)) { log("有残留的资料卡，先关掉"); closeCardGeneric(""); }
+  let header = genericHeader(CFG.waitRoom);
+  if (!header) return { skip: "非直播页 前台=" + curPkg() + " 首页=" + onHomeFeed() };
+  let hb = header.bounds();
+  let roomNick = headerNick(header);
+  if (!roomNick) return { skip: "读不到直播间昵称" };
+  let before = textKeys();
+  if (!header.click()) click.apply(null, px(CFG.avatarFallback[0], CFG.avatarFallback[1]));
+  sleep(1200);
+  let user = waitGenericCard(roomNick, hb, before, CFG.waitCard);
+  if (!user) {
+    if (!genericHeader(500) && (findOneText(CFG.cardMarkerRe) || findOneText(CFG.errorRe))) back();
+    return { skip: "卡片没弹出" };
+  }
+  closeCardGeneric(roomNick);
+  return { id: "@" + user.replace(/^@/, ""), nick: roomNick, mode: "通用" };
+}
+
 // 在首页的“推荐 / For You”信息流里
 function onHomeFeed() {
   return text("For You").exists() || desc("For You").exists() || text("推荐").exists() ||
@@ -92,7 +200,7 @@ function onHomeFeed() {
 // 在首页点左上角 LIVE 入口进入直播流；返回是否已进入直播间
 function enterLive() {
   for (let i = 0; i < 4; i++) {
-    if (roomHeader(1000)) return true;
+    if (anyHeader(1000)) return true;
     let entry = className("android.widget.ImageView").clickable(true)
       .boundsInside(0, 0, Math.round(W * 0.2), Math.round(H * 0.13)).findOne(1000);
     let onHome = onHomeFeed();
@@ -108,7 +216,7 @@ function enterLive() {
     }
     sleep(4000);
   }
-  return !!roomHeader(1500);
+  return !!anyHeader(1500);
 }
 
 // 当前前台包名。优先读活动窗口根节点：currentPackage() 刚启动时是空串，
@@ -218,7 +326,8 @@ function findOneText(re) {
   return textMatches(re).findOnce() || descMatches(re).findOnce();
 }
 
-let headerDesc = (timeout) => { let h = roomHeader(timeout || 800); return h ? h.desc() || "" : ""; };
+// 用昵称（不带点赞数，点赞数会一直变）判断是不是换了直播间
+let headerDesc = (timeout) => { let h = anyHeader(timeout || 800); return h ? headerNick(h) : ""; };
 
 // 翻到下一个直播间。首选 ViewPager 的无障碍翻页动作（实测有悬浮窗时手势经常不生效），
 // 不行再用上滑手势；用顶部条的“昵称,点赞数”判断是否真的换了直播间
@@ -288,7 +397,32 @@ threads.start(function () {
       continue;
     }
     try {
-      let r = grabOne();
+      let r = null;
+      if (idMode) {
+        r = grabOne();
+        if (r.id) idFails = 0;
+        else if (/^(非直播页|卡片没弹出|卡片里没读到用户名)/.test(r.skip) && !onHomeFeed()) {
+          // “非直播页”：通用识别能看到主播条而 ID 看不到 → ID 失效，这个直播间直接用通用识别补抓，不浪费；
+          // 两边都看不到只是当前不在直播间（弹窗、直播结束页等），不算 ID 失效
+          let idBroken = true;
+          if (r.skip.indexOf("非直播页") === 0) {
+            idBroken = !!genericHeader(800);
+            if (idBroken) { let rg = grabOneGeneric(); if (rg.id) r = rg; }
+          }
+          if (idBroken && ++idFails >= CFG.idFailLimit) {
+            idMode = false; genRooms = 0;
+            log("ID 识别连续失败 " + idFails + " 次，切换到通用识别");
+          }
+        }
+      } else {
+        genRooms++;
+        if (genRooms % CFG.retryIdEvery === 0) { // 每隔一段时间再试一次 ID
+          let rr = grabOne();
+          if (rr.id) { idMode = true; idFails = 0; r = rr; log("ID 识别恢复，切回 ID 识别"); }
+        }
+        if (!r) r = grabOneGeneric();
+      }
+      let tag = "[" + (r.mode || (idMode ? "ID" : "通用")) + "] ";
       let added = false;
       if (r.id) {
         missStreak = 0;
@@ -297,12 +431,12 @@ threads.start(function () {
           seen.add(r.id);
           files.append(CFG.outFile, r.id + "\n");
           count++;
-          log("新增 " + r.id + " (" + r.nick + ")");
+          log(tag + "新增 " + r.id + " (" + r.nick + ")");
         } else {
-          log("重复 " + r.id);
+          log(tag + "重复 " + r.id);
         }
       } else {
-        log("跳过：" + r.skip);
+        log(tag + "跳过：" + r.skip);
         if (r.skip.indexOf("非直播页") === 0 && (onHomeFeed() || ++missStreak >= CFG.maxMissStreak)) {
           log("连续 " + missStreak + " 次不在直播间，重新进入 LIVE");
           enterLive();
