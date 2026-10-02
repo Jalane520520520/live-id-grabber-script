@@ -3,7 +3,7 @@
 // 注意：全文只用 let，不要用 const。AutoX 的 Rhino 引擎里，循环体内的 const 只会赋值一次，
 // 之后每轮都保留第一次的值（实测：每个直播间都记成第一个用户名、找卡片一直超时）
 // 版本号：热更新加载器靠这个标记判断下载内容是否有效，悬浮窗也会显示。每次推送加 0.1
-let SCRIPT_VERSION = "1.2";
+let SCRIPT_VERSION = "1.2.1";
 
 auto.waitFor();
 
@@ -369,7 +369,15 @@ function humanTap(node) {
 // 拟人上滑：起止点随机，中间带弯曲，时长 300–700 毫秒
 function humanSwipe() {
   let x0 = W / 2 + random(-90, 90), y0 = Math.round(H * (CFG.swipeY[0] + random(-4, 4) / 100));
-  let y1 = Math.round(H * (CFG.swipeY[1] + random(-3, 3) / 100)), x1 = x0 + random(-70, 70);
+  let y1 = Math.round(H * (CFG.swipeY[1] + random(-3, 3) / 100));
+  try {
+    let fl = win.getX(), ft = win.getY(), fb = ft + win.getHeight();
+    let lim = fl - 120; // 路径向右最多偏 80，再留 40 的余量
+    if (fl > 0 && fb > Math.min(y0, y1) && ft < Math.max(y0, y1) && x0 > lim) {
+      x0 = lim >= Math.round(W * 0.25) ? random(Math.round(W * 0.25), lim) : Math.max(60, lim);
+    }
+  } catch (e) {}
+  let x1 = x0 + random(-70, 70);
   let bow = random(-80, 80);
   let ym = y0 + Math.round((y1 - y0) * (0.35 + random(0, 20) / 100));
   return gesture(rnd(CFG.swipeMs), [x0, y0], [x0 + bow, ym], [x1, y1]);
@@ -421,17 +429,17 @@ let win = floaty.window(
       <button id="quit" text="退出" w="64" h="40" textSize="12sp"/>
     </horizontal>
     <horizontal>
-      <button id="copy" text="复制全部" w="64" h="40" textSize="11sp"/>
+      <button id="copy" text="复制全部" w="88" h="40" textSize="11sp"/>
       <button id="share" text="分享" w="64" h="40" textSize="11sp"/>
     </horizontal>
   </vertical>
 );
-// 贴右边、屏幕 40% 高度处；按实际宽度放，避免出屏
-ui.post(() => win.setPosition(Math.max(0, W - win.getWidth()), Math.round(H * 0.4)), 300);
+// 贴右上角（不要放在屏幕中部：会盖住上滑的起点，实测弯曲上滑 9/10 退回旧方式）；按实际宽度放，避免出屏
+ui.post(() => win.setPosition(Math.max(0, W - win.getWidth()), Math.round(H * 0.04)), 300);
 // 文字变长后窗口会向右伸出屏幕（警告语被截断），所以每次改字后重新贴右边
 let setInfo = (s) => {
   ui.run(() => win.info.setText("v" + SCRIPT_VERSION + " " + s));
-  ui.post(() => win.setPosition(Math.max(0, W - win.getWidth()), Math.round(H * 0.4)), 200);
+  ui.post(() => win.setPosition(Math.max(0, W - win.getWidth()), Math.round(H * 0.04)), 200);
 };
 setInfo("待开始");
 
