@@ -3,7 +3,7 @@
 // 注意：全文只用 let，不要用 const。AutoX 的 Rhino 引擎里，循环体内的 const 只会赋值一次，
 // 之后每轮都保留第一次的值（实测：每个直播间都记成第一个用户名、找卡片一直超时）
 // 版本号：热更新加载器靠这个标记判断下载内容是否有效，悬浮窗也会显示。每次推送加 0.1
-let SCRIPT_VERSION = "1.1";
+let SCRIPT_VERSION = "1.2";
 
 auto.waitFor();
 
@@ -28,15 +28,25 @@ let CFG = {
   swipeY: [0.55, 0.15],                        // 上滑起止（屏幕比例）。不要从 0.7 以下开始，会滑到评论区/商品卡上无效
   waitRoom: 7000,                              // 翻页后等直播间顶部条出现的最长时间 ms
   waitCard: 6000,                             // 等卡片弹出的最长时间 ms（点头像后先等 1.2s 再开始查）
+  // ---- 节奏：和 v1.1 一样（最快档）----
   delay: [2500, 6000],                         // 每个直播间之间随机等待 ms（不得低于 2500）
   restEvery: 40,                               // 每抓多少个休息一次
   restMs: [60000, 150000],                     // 休息时长 ms
+  pressMs: [60, 150],                          // 点击按下时长
+  swipeMs: [300, 700],                         // 上滑时长
   pkgs: ["com.zhiliaoapp.musically", "com.ss.android.ugc.trill"], // TikTok 包名（国际版 / 亚洲版）
   logFile: "/sdcard/Download/grabber.log",
   lockFile: "/sdcard/Download/grabber.lock",   // 单实例锁
   autostartFlag: "/sdcard/Download/grabber_autostart", // 调试用：存在此文件则启动即运行，不用点悬浮窗
   maxRelaunch: 3,                              // 连续拉回失败几次后暂停
-  maxMissStreak: 4,                            // 连续这么多次不在直播间，就重新导航进 LIVE
+  netUrl: "https://www.tiktok.com",           // 网络检测：能拿到任何 HTTP 响应就算通
+  netTimeoutMs: 5000,                          // 单次检测超时
+  netCheckMs: 5 * 60 * 1000,                   // 正常运行时每隔多久检测一次
+  netRetryMs: 30 * 1000,                       // 网络断开后每隔多久重试
+  netSuspectStreak: 3,                         // 连续这么多次进不了 LIVE / 读不到卡片，就检测一次
+  nonLiveStreak: 2,                            // 连续这么多次不是直播间画面（且不是网络问题），就退避
+  backoffFails: 3,                             // 退避后仍没回到直播间，累计这么多次就暂停等人看一下
+  backoffWindowMs: 10 * 60 * 1000,             // ……在这个时间窗口内
 };
 // ========================================
 
@@ -47,9 +57,22 @@ let W = device.width, H = device.height;
 let rnd = (r) => random(r[0], r[1]);
 let px = (fx, fy) => [Math.round(W * fx), Math.round(H * fy)];
 
+// 用户名不带 @。旧文件里带 @ 的记录启动时统一去掉 @，同一个名字带不带 @ 只算一个
 let seen = new Set();
 if (files.exists(CFG.outFile)) {
-  files.read(CFG.outFile).split("\n").forEach((l) => { l = l.trim(); if (l) seen.add(l); });
+  let uniq = [], changed = false;
+  files.read(CFG.outFile).split("\n").forEach((l) => {
+    l = l.trim();
+    if (!l) return;
+    let n = l.replace(/^@+/, "");
+    if (n !== l) changed = true;
+    if (seen.has(n)) { changed = true; return; }
+    seen.add(n); uniq.push(n);
+  });
+  if (changed) {
+    files.write(CFG.outFile, uniq.length ? uniq.join("\n") + "\n" : "");
+    log("已把旧文件里的 @ 去掉并去重，共 " + uniq.length + " 个");
+  }
 }
 let running = false, count = 0, relaunchFails = 0, missStreak = 0;
 let targetPkg = CFG.pkgs.filter((p) => app.getAppName(p))[0] || CFG.pkgs[0];
@@ -180,15 +203,21 @@ function grabOneGeneric() {
   let roomNick = headerNick(header);
   if (!roomNick) return { skip: "读不到直播间昵称" };
   let before = textKeys();
-  if (!header.click()) click.apply(null, px(CFG.avatarFallback[0], CFG.avatarFallback[1]));
+  humanTap(header);
   sleep(1200);
-  let user = waitGenericCard(roomNick, hb, before, CFG.waitCard);
+  let user = waitGenericCard(roomNick, hb, before, 2500);
+  if (!user) {
+    log("手势没点开卡片，改用无障碍点击");
+    if (!header.click()) click.apply(null, px(CFG.avatarFallback[0], CFG.avatarFallback[1]));
+    sleep(800);
+    user = waitGenericCard(roomNick, hb, before, CFG.waitCard);
+  }
   if (!user) {
     if (!genericHeader(500) && (findOneText(CFG.cardMarkerRe) || findOneText(CFG.errorRe))) back();
     return { skip: "卡片没弹出" };
   }
   closeCardGeneric(roomNick);
-  return { id: "@" + user.replace(/^@/, ""), nick: roomNick, mode: "通用" };
+  return { id: user.replace(/^@+/, ""), nick: roomNick, mode: "通用" };
 }
 
 // 在首页的“推荐 / For You”信息流里
@@ -294,13 +323,18 @@ function grabOne() {
   }
   let roomNick = (header.desc() || "").replace(/,[^,]*$/, "").trim(); // "昵称,点赞数" → 昵称
 
-  // 用无障碍点击动作：实测有悬浮窗时 click(x,y)/press() 手势点不开卡片，header.click() 可以
-  let clicked = header.click();
-  if (!clicked) click.apply(null, px(CFG.avatarFallback[0], CFG.avatarFallback[1]));
-
+  // 先用拟人手势点头像；手势没点开就退回无障碍点击（实测有悬浮窗时手势偶尔点不开，header.click() 可靠）
+  let clicked = humanTap(header);
   let t0 = Date.now();
   sleep(1200); // 卡片加载要时间，先别查
-  let nick = findVisible(byId(CFG.ids.cardNick), CFG.waitCard);
+  let nick = findVisible(byId(CFG.ids.cardNick), 2500);
+  if (!nick) {
+    log("手势没点开卡片，改用无障碍点击");
+    clicked = header.click();
+    if (!clicked) click.apply(null, px(CFG.avatarFallback[0], CFG.avatarFallback[1]));
+    sleep(800);
+    nick = findVisible(byId(CFG.ids.cardNick), CFG.waitCard);
+  }
   if (DEBUG) log("调试 click=" + clicked + " 用时=" + (Date.now() - t0) + " jkv全部=" + byId(CFG.ids.cardNick).find().map((n) => n.bounds() + "/vis=" + n.visibleToUser() + "/on=" + onScreen(n)).join(";") +
     " root=" + curPkg() + " header仍在=" + !!byId(CFG.ids.roomHeader).findOnce());
   if (!nick) {
@@ -319,7 +353,26 @@ function grabOne() {
   if (roomNick && cardNick && roomNick !== cardNick) {
     return { skip: "卡片和直播间不一致 房间=" + roomNick + " 卡片=" + cardNick };
   }
-  return { id: "@" + user.replace(/^@/, ""), nick: cardNick };
+  return { id: user.replace(/^@+/, ""), nick: cardNick };
+}
+
+// 拟人点击：只点主播条最左边的头像范围（避开右边的“关注”按钮，免得误关注主播），位置随机偏移，按下 60–150 毫秒。
+// 手势在个别情况下点不开（见 CLAUDE.md），所以点完要检查卡片，没开就退回无障碍点击
+function humanTap(node) {
+  try {
+    let b = node.bounds(), h = b.height();
+    let x = random(b.left + Math.round(h * 0.2), b.left + Math.round(h * 0.8));
+    let y = random(b.top + Math.round(h * 0.25), b.bottom - Math.round(h * 0.25));
+    return press(x, y, rnd(CFG.pressMs));
+  } catch (e) { if (isInterrupt(e)) throw e; return false; }
+}
+// 拟人上滑：起止点随机，中间带弯曲，时长 300–700 毫秒
+function humanSwipe() {
+  let x0 = W / 2 + random(-90, 90), y0 = Math.round(H * (CFG.swipeY[0] + random(-4, 4) / 100));
+  let y1 = Math.round(H * (CFG.swipeY[1] + random(-3, 3) / 100)), x1 = x0 + random(-70, 70);
+  let bow = random(-80, 80);
+  let ym = y0 + Math.round((y1 - y0) * (0.35 + random(0, 20) / 100));
+  return gesture(rnd(CFG.swipeMs), [x0, y0], [x0 + bow, ym], [x1, y1]);
 }
 
 function findOneText(re) {
@@ -329,24 +382,34 @@ function findOneText(re) {
 // 用昵称（不带点赞数，点赞数会一直变）判断是不是换了直播间
 let headerDesc = (timeout) => { let h = anyHeader(timeout || 800); return h ? headerNick(h) : ""; };
 
-// 翻到下一个直播间。首选 ViewPager 的无障碍翻页动作（实测有悬浮窗时手势经常不生效），
-// 不行再用上滑手势；用顶部条的“昵称,点赞数”判断是否真的换了直播间
+// 翻到下一个直播间。先用拟人的弯曲上滑；没换房间就用 ViewPager 的无障碍翻页动作，再不行用直线上滑。
+// 用顶部条的昵称判断是否真的换了直播间
 function nextLive() {
   let before = headerDesc(2500);
-  let pager = className("androidx.viewpager.widget.ViewPager").scrollable(true).findOnce();
-  if (!(pager && pager.scrollForward())) {
-    let x = W / 2 + random(-60, 60);
-    swipe(x, H * CFG.swipeY[0] + random(-40, 40), x + random(-30, 30), H * CFG.swipeY[1], random(180, 300));
-  }
+  humanSwipe();
   sleep(random(2000, 3000)); // 等直播间加载
   let after = headerDesc(1500);
-  if (DEBUG) log("调试 翻页 前=" + before + " pager=" + !!pager + " 后=" + after);
   if (before && after === before) {
-    log("没换到下一个直播间，改用上滑手势");
-    let sx = W / 2 + random(-60, 60);
-    swipe(sx, H * CFG.swipeY[0], sx, H * CFG.swipeY[1], random(180, 300));
-    sleep(2500);
+    log("弯曲上滑没换房间，改用无障碍翻页");
+    let pager = className("androidx.viewpager.widget.ViewPager").scrollable(true).findOnce();
+    if (!(pager && pager.scrollForward())) {
+      let sx = W / 2 + random(-60, 60);
+      swipe(sx, H * CFG.swipeY[0], sx, H * CFG.swipeY[1], random(180, 300));
+    }
+    sleep(random(2000, 3000));
   }
+}
+
+// ---------------- 网络检测 ----------------
+// 请求 TikTok 首页，5 秒超时。拿到任何 HTTP 响应（哪怕 403）都说明网络和 VPN 是通的
+function netOk() {
+  let ok = false;
+  let t = threads.start(function () {
+    try { let r = http.get(CFG.netUrl, { headers: { "Cache-Control": "no-cache" } }); ok = !!r && r.statusCode > 0; } catch (e) { ok = false; }
+  });
+  t.join(CFG.netTimeoutMs);
+  if (t.isAlive()) { t.interrupt(); ok = false; }
+  return ok;
 }
 
 // ---------------- 悬浮窗 ----------------
@@ -357,11 +420,19 @@ let win = floaty.window(
       <button id="toggle" text="开始" w="64" h="40" textSize="12sp"/>
       <button id="quit" text="退出" w="64" h="40" textSize="12sp"/>
     </horizontal>
+    <horizontal>
+      <button id="copy" text="复制全部" w="64" h="40" textSize="11sp"/>
+      <button id="share" text="分享" w="64" h="40" textSize="11sp"/>
+    </horizontal>
   </vertical>
 );
 // 贴右边、屏幕 40% 高度处；按实际宽度放，避免出屏
 ui.post(() => win.setPosition(Math.max(0, W - win.getWidth()), Math.round(H * 0.4)), 300);
-let setInfo = (s) => ui.run(() => win.info.setText("v" + SCRIPT_VERSION + " " + s));
+// 文字变长后窗口会向右伸出屏幕（警告语被截断），所以每次改字后重新贴右边
+let setInfo = (s) => {
+  ui.run(() => win.info.setText("v" + SCRIPT_VERSION + " " + s));
+  ui.post(() => win.setPosition(Math.max(0, W - win.getWidth()), Math.round(H * 0.4)), 200);
+};
 setInfo("待开始");
 
 win.toggle.click(() => {
@@ -371,6 +442,42 @@ win.toggle.click(() => {
   log(running ? "开始" : "暂停");
 });
 win.quit.click(() => { log("退出"); win.close(); exit(); });
+
+// ---------------- 结果导出（2.10） ----------------
+let readNames = () => (files.exists(CFG.outFile) ? files.read(CFG.outFile).split("\n").map((l) => l.trim().replace(/^@+/, "")).filter((l) => l) : []);
+// 复制全部：每行一个用户名，放进剪贴板，提示“已复制 N 个”
+win.copy.click(() => {
+  try {
+    let names = readNames();
+    setClip(names.join("\n"));
+    toast("已复制 " + names.length + " 个");
+    log("复制全部 " + names.length + " 个");
+  } catch (e) { toast("复制失败：" + e); log("复制失败: " + e); }
+});
+// 分享：用安卓分享菜单发送 streamers.txt（可直接选微信）；文件分享不成功就退回分享纯文本
+win.share.click(() => {
+  try {
+    let I = android.content.Intent;
+    if (!files.exists(CFG.outFile) || !readNames().length) { toast("还没有结果可分享"); return; }
+    let it = new I(I.ACTION_SEND), how = "文件";
+    try {
+      let uri = app.getUriForFile(CFG.outFile);
+      it.setType("text/plain");
+      it.putExtra(I.EXTRA_STREAM, uri);
+      it.addFlags(I.FLAG_GRANT_READ_URI_PERMISSION);
+    } catch (e) {
+      how = "文本";
+      log("文件分享不可用，改分享文本: " + e);
+      it = new I(I.ACTION_SEND);
+      it.setType("text/plain");
+      it.putExtra(I.EXTRA_TEXT, readNames().join("\n"));
+    }
+    let ch = I.createChooser(it, "分享主播列表");
+    ch.addFlags(I.FLAG_ACTIVITY_NEW_TASK);
+    context.startActivity(ch);
+    log("分享（" + how + "）");
+  } catch (e) { toast("分享失败：" + e); log("分享失败: " + e); }
+});
 
 // ---------------- 主循环 ----------------
 // 脚本被停止时让工作线程也退出（否则线程会成为孤儿继续操作手机，和新启动的脚本互相打架）
@@ -383,10 +490,83 @@ let myToken = String(Date.now()) + "-" + random(1000, 9999);
 files.write(CFG.lockFile, myToken);
 let isCurrent = () => { try { return files.read(CFG.lockFile) === myToken; } catch (e) { return true; } };
 
+// ---------------- 通用自动退避（2.7） ----------------
+// 不识别具体是什么窗口（滑块、广告、别的页面都一样），只看“是不是直播间画面”：
+// 连续 2 次不是直播间画面、并且不是网络问题 → 按返回 → 还不是 → 强制关闭并重启 TikTok → 自动进入 LIVE → 继续抓
+let nonLive = 0, backoffFailTimes = [], haltedByBackoff = false;
+
+// 强制关闭 TikTok：打开系统的应用信息页点“强行停止”（各品牌的文字不同，用正则匹配）；点不到就退一步用 killBackgroundProcesses
+function stopTikTok() {
+  let clickNode = (n) => { if (!n) return false; if (n.click()) return true; let b = n.bounds(); return click(b.centerX(), b.centerY()); };
+  let done = false;
+  try {
+    app.openAppSetting(targetPkg);
+    sleep(2500);
+    let btn = textMatches(/^(强行停止|强制停止|结束运行|Force stop|FORCE STOP|Force Stop)$/).findOne(4000);
+    if (btn && btn.enabled()) {
+      clickNode(btn);
+      sleep(1200);
+      // 确认弹窗：优先用系统对话框的确定键，找不到再按文字
+      let ok = id("android:id/button1").findOne(2500) || textMatches(/^(确定|OK|ok)$/).findOne(1500);
+      if (ok) { clickNode(ok); done = true; sleep(1500); }
+    }
+  } catch (e) { if (isInterrupt(e)) throw e; log("强行停止出错: " + e); }
+  if (!done) {
+    log("没点到“强行停止”，改用 killBackgroundProcesses");
+    try { home(); sleep(1000); context.getSystemService("activity").killBackgroundProcesses(targetPkg); sleep(1500); done = true; }
+    catch (e) { if (isInterrupt(e)) throw e; log("killBackgroundProcesses 失败: " + e); }
+  }
+  return done;
+}
+
+// 返回是否已回到直播间
+function backoff() {
+  log("退避：按返回");
+  back();
+  sleep(random(1500, 2500));
+  if (anyHeader(2500)) return true;
+  log("退避：还不是直播间，强制关闭并重启 TikTok");
+  stopTikTok();
+  app.launch(targetPkg);
+  sleep(7000);
+  if (enterLive()) return true;
+  return !!anyHeader(3000);
+}
+
+// 休息：每秒检查一次，用户点暂停或退出能立刻响应
+function nap(ms, label, logLabel) {
+  log(logLabel + " " + Math.round(ms / 1000) + "s");
+  for (let w = 0; w < ms && !stopped && running; w += 1000) {
+    setInfo(label + "中，约 " + Math.max(1, Math.round((ms - w) / 60000)) + " 分钟后继续");
+    sleep(1000);
+  }
+}
+
+let lastNetCheck = 0, netSuspect = 0;
+// 检测网络；断开时自动暂停，每 30 秒重试，恢复后自动继续，不需要客户操作。返回 false 表示等待期间被用户暂停或退出
+function ensureNet(reason) {
+  if (netOk()) { lastNetCheck = Date.now(); return true; }
+  log("网络检测失败（" + reason + "），暂停，每 " + CFG.netRetryMs / 1000 + " 秒重试");
+  while (!stopped && isCurrent() && running) {
+    setInfo("⚠️ 网络断开，请检查网络 / VPN");
+    for (let w = 0; w < CFG.netRetryMs && !stopped && running; w += 1000) sleep(1000);
+    if (stopped || !running) return false;
+    if (netOk()) {
+      log("网络恢复，自动继续");
+      setInfo("网络恢复，继续运行");
+      lastNetCheck = Date.now(); netSuspect = 0; missStreak = 0;
+      return true;
+    }
+  }
+  return false;
+}
+
 threads.start(function () {
   while (!stopped) {
     if (!isCurrent()) { log("发现新启动的实例，本实例退出"); break; }
     if (!running) { sleep(500); continue; }
+    if (haltedByBackoff) { haltedByBackoff = false; backoffFailTimes = []; nonLive = 0; log("人工恢复，重新开始计数"); }
+    if (Date.now() - lastNetCheck >= CFG.netCheckMs && !ensureNet(lastNetCheck ? "定时" : "启动")) continue;
     if (!ensureInApp()) {
       if (relaunchFails >= CFG.maxRelaunch) {
         running = false;
@@ -437,22 +617,45 @@ threads.start(function () {
         }
       } else {
         log(tag + "跳过：" + r.skip);
-        if (r.skip.indexOf("非直播页") === 0 && (onHomeFeed() || ++missStreak >= CFG.maxMissStreak)) {
-          log("连续 " + missStreak + " 次不在直播间，重新进入 LIVE");
-          enterLive();
-          missStreak = 0;
-          continue;
+        if (r.skip.indexOf("非直播页") === 0) {
+          if (onHomeFeed()) { // 被带回了首页：直接重新进入 LIVE，不算退避
+            log("在首页，重新进入 LIVE");
+            enterLive(); nonLive = 0;
+            continue;
+          }
+          if (++nonLive >= CFG.nonLiveStreak) {
+            nonLive = 0;
+            if (!netOk()) { ensureNet("连续不是直播间画面"); continue; } // 网络问题走断网流程，不退避
+            let now = Date.now();
+            if (backoff()) { backoffFailTimes = []; log("退避成功，继续抓取"); }
+            else {
+              backoffFailTimes.push(now);
+              backoffFailTimes = backoffFailTimes.filter((t) => now - t <= CFG.backoffWindowMs);
+              log("退避后仍不是直播间（" + backoffFailTimes.length + "/" + CFG.backoffFails + "）");
+              if (backoffFailTimes.length >= CFG.backoffFails) {
+                running = false; haltedByBackoff = true;
+                ui.run(() => win.toggle.setText("开始"));
+                setInfo("⚠️ TikTok 一直弹窗，请看一下手机");
+                log("退避 " + CFG.backoffFails + " 次都没恢复，暂停，等人处理后点开始");
+              }
+            }
+            continue;
+          }
+        } else { nonLive = 0; }
+      }
+      if (r.id) { netSuspect = 0; nonLive = 0; }
+      else if (/^(非直播页|卡片没弹出)/.test(r.skip)) {
+        // 连续进不了 LIVE，或者卡片上出现 “Network error / Retry”，都检测一次网络
+        netSuspect++;
+        if (netSuspect >= CFG.netSuspectStreak || findVisible(textMatches(CFG.errorRe), 300)) {
+          netSuspect = 0;
+          if (!ensureNet("连续失败/网络错误")) continue;
         }
       }
       setInfo("运行中 已抓 " + count + " / 总 " + seen.size);
 
       if (count >= CFG.maxCount) { running = false; setInfo("已达上限 " + count); log("已达上限"); continue; }
-      if (added && count % CFG.restEvery === 0) {
-        let ms = rnd(CFG.restMs);
-        setInfo("休息 " + Math.round(ms / 1000) + "s");
-        log("休息 " + Math.round(ms / 1000) + "s");
-        sleep(ms);
-      }
+      if (added && count % CFG.restEvery === 0) nap(rnd(CFG.restMs), "休息", "休息");
       nextLive();
       sleep(rnd(CFG.delay));
     } catch (e) {
