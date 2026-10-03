@@ -3,7 +3,7 @@
 // 注意：全文只用 let，不要用 const。AutoX 的 Rhino 引擎里，循环体内的 const 只会赋值一次，
 // 之后每轮都保留第一次的值（实测：每个直播间都记成第一个用户名、找卡片一直超时）
 // 版本号：热更新加载器靠这个标记判断下载内容是否有效，悬浮窗也会显示。每次推送加 0.1
-let SCRIPT_VERSION = "1.3";
+let SCRIPT_VERSION = "1.4"; // 新增：机端图像分析 + 自动滑块求解（Sobel 边缘检测，Android Bitmap API）
 
 auto.waitFor();
 
@@ -39,6 +39,8 @@ let CFG = {
   lockFile: "/sdcard/Download/grabber.lock",   // 单实例锁
   autostartFlag: "/sdcard/Download/grabber_autostart", // 调试用：存在此文件则启动即运行，不用点悬浮窗
   maxRelaunch: 3,                              // 连续拉回失败几次后暂停
+  autoSolveEnabled: true,                      // 是否启用机端自动滑块求解
+  autoSolveMaxPer5Min: 9,                      // 5 分钟内最多拖几次（每个滑块最多 3 次；用户：不用管账号）
   netUrl: "https://www.tiktok.com",           // 网络检测：能拿到任何 HTTP 响应就算通
   plainUrl: "https://www.baidu.com",           // 普通网站：它通而 TikTok 不通 = VPN 断开；两个都不通 = 没有网络
   netTimeoutMs: 5000,                          // 单次检测超时（定时检测）
@@ -80,6 +82,14 @@ if (files.exists(CFG.outFile)) {
 let running = false, count = 0, relaunchFails = 0, missStreak = 0, liveFails = 0;
 let targetPkg = CFG.pkgs.filter((p) => app.getAppName(p))[0] || CFG.pkgs[0];
 log("启动 v" + SCRIPT_VERSION + " 屏幕=" + W + "x" + H + " 包名=" + targetPkg + " 已有=" + seen.size);
+
+// 自动滑块求解要截图，必须先申请截图权限（系统会弹“开始截取屏幕”授权框，每次启动都要点一次）。
+// 拒绝或失败 = 本次运行不自动求解，遇到滑块直接走按返回流程，抓取不受影响
+let screenCapOk = false;
+if (CFG.autoSolveEnabled) {
+  try { screenCapOk = !!requestScreenCapture(false); } catch (e) { log("申请截图权限出错：" + e); }
+  log(screenCapOk ? "已获得截图权限，自动求解开启" : "未获得截图权限，自动求解关闭");
+}
 
 // 必须用完整 ID：id("acd") 会被补成 currentPackage()+":id/acd"，而悬浮窗会让 currentPackage() 变成 AutoX，永远匹配不到
 let byId = (s) => id(targetPkg + ":id/" + s);
@@ -1174,6 +1184,393 @@ function overlaySuspect() {
   else if (!hit && (web || big) && bigLogged < 5) { bigLogged++; log("2.18 候选（只记录，不触发）: " + (web || big)); }
   return hit;
 }
+// ======== 机端自动滑块求解（v1.4，ported from solver.py PuzzleSolver） ========
+// 全部用 Android Bitmap API + 纯 JS 算法，不依赖外部服务。
+// 核心流程：截图 → 裁出验证码区域 → Sobel 边缘检测 → 按列求和找峰值（缺口位置） → 模拟拖拽。
+
+// bmpToGray(bmp) —— Android Bitmap 转灰度 Int16Array（逐行，与原始宽高一致）
+// 关键：用 bmp.getPixels() 一次取回所有像素（Java int[]），避免逐像素 getPixel() 的性能陷阱
+function bmpToGray(bmp) {
+  let w = bmp.getWidth(), h = bmp.getHeight(), len = w * h;
+  let pixels = java.lang.reflect.Array.newInstance(java.lang.Integer.TYPE, len);
+  bmp.getPixels(pixels, 0, w, 0, 0, w, h);
+  let gray = new Array(len);
+  for (let i = 0; i < len; i++) {
+    let c = pixels[i];
+    let r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+    gray[i] = (r * 76 + g * 150 + b * 29) >> 8; // BT.601 近似整数运算
+  }
+  return { data: gray, w: w, h: h };
+}
+
+// sobelRect(gray, out, xa, xb, ya, yb) —— 3×3 Sobel 边缘强度（|gx|+|gy|），只算这个矩形，写进 out（v4.13 提速：
+// 先只算左边 30% 找拼图块，再只对拼图块那几行算全宽）。不归一化：后面只用相对大小
+function sobelRect(gray, out, xa, xb, ya, yb) {
+  let d = gray.data, w = gray.w, h = gray.h;
+  xa = Math.max(1, xa); xb = Math.min(w - 2, xb); ya = Math.max(1, ya); yb = Math.min(h - 2, yb);
+  for (let y = ya; y <= yb; y++) {
+    let r0 = (y - 1) * w, r1 = y * w, r2 = (y + 1) * w;
+    for (let x = xa; x <= xb; x++) {
+      let gx = -d[r0 + x - 1] + d[r0 + x + 1] - 2 * d[r1 + x - 1] + 2 * d[r1 + x + 1] - d[r2 + x - 1] + d[r2 + x + 1];
+      let gy = -d[r0 + x - 1] - 2 * d[r0 + x] - d[r0 + x + 1] + d[r2 + x - 1] + 2 * d[r2 + x] + d[r2 + x + 1];
+      out[r1 + x] = (gx < 0 ? -gx : gx) + (gy < 0 ? -gy : gy);
+    }
+  }
+}
+
+// cropScreen(rect) —— 截全屏后裁出指定 Rect（无障碍树 getBoundsInScreen 返回的对象），返回 Android Bitmap
+function cropScreen(rect) {
+  let shot = images.captureScreen();
+  if (!shot) return null;
+  let bmp = shot.getBitmap ? shot.getBitmap() : shot; // AutoX Image 封装
+  let l = rect.left, t = rect.top, rw = rect.width(), rh = rect.height();
+  if (l < 0) l = 0; if (t < 0) t = 0;
+  if (l + rw > bmp.getWidth()) rw = bmp.getWidth() - l;
+  if (t + rh > bmp.getHeight()) rh = bmp.getHeight() - t;
+  if (rw <= 0 || rh <= 0) return null;
+  return android.graphics.Bitmap.createBitmap(bmp, l, t, rw, rh);
+}
+
+// autoSolveCaptcha() —— 主入口：找验证码容器 → 最多拖 3 次（v4.13 2.27），每次：截图 → 分析 → 拖 → 等结果
+// 返回 "ok"（验证框消失）/ "fail"（3 次都没过，或识别失败）/ "skip"（未启用 / 超限）
+let autoSolveTimes = [], lastTrack = null;
+// 调试样本（只有存在 grabber_debug 时才存）：核对缺口找得准不准。交付前删掉 grabber_debug
+let SOLVE_SAMPLE_DIR = "/sdcard/Download/captcha_samples/";
+function saveSample(bmp, name) {
+  if (!files.exists("/sdcard/Download/grabber_debug") || !bmp) return;
+  try {
+    files.ensureDir(SOLVE_SAMPLE_DIR);
+    let out = new java.io.FileOutputStream(SOLVE_SAMPLE_DIR + name + ".png");
+    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out);
+    out.close();
+  } catch (e) { log("保存样本失败 " + e); }
+}
+function autoSolveCaptcha() {
+  if (!CFG.autoSolveEnabled || !screenCapOk) return "skip";
+  let now = Date.now();
+  autoSolveTimes = autoSolveTimes.filter((t) => now - t <= 5 * 60 * 1000);
+  if (autoSolveTimes.length >= CFG.autoSolveMaxPer5Min) {
+    log("自动求解：5 分钟内已解 " + autoSolveTimes.length + " 次，跳过本次保护账号");
+    return "skip";
+  }
+
+  // 1. 从无障碍树找验证码容器节点（captcha_container 或 secsdk-captcha-drag-wrapper 的父容器）
+  let r = null; try { r = auto.root; } catch (e) {}
+  if (!r) return "fail";
+
+  let captchaNode = null, dragNode = null;
+  let walk2 = function(n, depth) {
+    if (!n || depth > 12 || captchaNode) return;
+    let nid = ""; try { nid = String(n.id() || ""); } catch (e) {}
+    if (/captcha_container/i.test(nid)) { captchaNode = n; return; }
+    if (/secsdk-captcha-drag-wrapper/i.test(nid)) { dragNode = n; }
+    let c = 0; try { c = n.childCount(); } catch (e) {}
+    for (let i = 0; i < c; i++) { let ch = null; try { ch = n.child(i); } catch (e) {} walk2(ch, depth + 1); }
+  };
+  try { walk2(r, 0); } catch (e) { if (isInterrupt(e)) throw e; }
+
+  // 也接受通过 overlaySuspect 识别到的通用大 WebView 区域，但优先用精确节点
+  let containerNode = captchaNode;
+  if (!containerNode) {
+    // 找第一个覆盖屏幕 8% 以上的 WebView
+    let k2 = 0;
+    let findWebView = function(n) {
+      if (!n || k2 > 500 || containerNode) return;
+      k2++;
+      let cn = ""; try { cn = String(n.className()); } catch (e) {}
+      if (/WebView/i.test(cn)) {
+        let b = null; try { b = n.bounds(); } catch (e) {}
+        if (b && b.width() * b.height() / (W * H) >= 0.08) { containerNode = n; return; }
+      }
+      let c = 0; try { c = n.childCount(); } catch (e) {}
+      for (let i = 0; i < c; i++) { let ch = null; try { ch = n.child(i); } catch (e) {} findWebView(ch); }
+    };
+    try { findWebView(r); } catch (e) {}
+  }
+  if (!containerNode) { log("自动求解：找不到验证码容器节点"); return "fail"; }
+
+  let cb = null; try { cb = containerNode.bounds(); } catch (e) {}
+  if (!cb || cb.width() <= 0 || cb.height() <= 0) { log("自动求解：验证码容器 bounds 无效"); return "fail"; }
+  log("自动求解：找节点 " + (Date.now() - now) + "ms");
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (!running) return "fail";
+    let res = solveOnce(cb, dragNode, attempt, attempt > 1 ? lastTrack : null);
+    if (res === "ok") return "ok";
+    if (res !== "retry") return "fail";
+    if (attempt < 3) log("自动求解：第 " + attempt + " 次没过，换了新图，马上再试");
+  }
+  log("自动求解：3 次都没过");
+  return "fail";
+}
+
+// solveOnce(cb, dragNode, attempt, trk0) —— trk0 = 第 1 次看到的滑条（滑块在起点），后面几次用来确认新图已经复位。 一次完整尝试。返回 "ok" / "retry"（TikTok 换了新图，可以再试）/ "fail"（识别失败或一直没反应）
+function solveOnce(cb, dragNode, attempt, trk0, wait) {
+  if (wait == null) wait = 6; // 画面没准备好时最多重拍 6 次（每次 0.5 秒）
+  let t0 = Date.now();
+  // 2. 截图并裁出验证码区域
+  let puzzleBmp = null;
+  try { puzzleBmp = cropScreen(cb); } catch (e) { log("自动求解：截图失败 " + e); return "fail"; }
+  if (!puzzleBmp) { log("自动求解：截图裁剪失败"); return "fail"; }
+  let tShot = Date.now();
+
+  // 3. 先缩小到 1/3 再分析（全尺寸在 Rhino 里要 20 多秒）
+  let SC = 3;
+  let pW = puzzleBmp.getWidth(), pH = puzzleBmp.getHeight();
+  let small = android.graphics.Bitmap.createScaledBitmap(puzzleBmp, Math.max(1, Math.round(pW / SC)), Math.max(1, Math.round(pH / SC)), true);
+  let grayPuzzle = bmpToGray(small);
+  let sw = grayPuzzle.w, sh = grayPuzzle.h;
+  let tGray = Date.now();
+
+  // 4. 找滑条：下半部分一整条浅灰横带，滑块是它左端的白色方块
+  let track = findTrack(grayPuzzle);
+  let imgTop = Math.round(sh * 0.16), imgBottom = track ? track.top - 1 : sh - 1; // 拼图图片区域：标题以下、滑条以上
+  let tTrack = Date.now();
+  // 新图还没画完（比如还在显示“Unable to verify”）：滑块不在起点，或者相关高得离谱（> 0.95，等于拿模板跟自己比）→ 等一下重拍
+  let mt = track ? matchPiece(grayPuzzle, imgTop, imgBottom) : null;
+  if (!track || !mt || mt.score > 0.95 || (trk0 && !handleAtStart(grayPuzzle, trk0))) {
+    if (wait > 0) { sleep(500); return solveOnce(cb, dragNode, attempt, trk0, wait - 1); }
+    log("自动求解 第" + attempt + "次：画面一直没准备好（" + (!track ? "没找到滑条" : !mt ? "没找到拼图块" : "相关=" + mt.score.toFixed(2)) + "）");
+    return "fail";
+  }
+  let tMatch = Date.now();
+  // v4.14 2.28：去掉原来的 +3 补偿（09:27 量化落点：带 +3 时系统性多拖 3–4 像素）。略过缺口的 bias 在 humanDrag 里加
+  let dist = (mt.to - mt.from) * SC;
+  let sampleTag = new java.text.SimpleDateFormat("HHmmss").format(new java.util.Date()) + "_try" + attempt;
+  saveSample(puzzleBmp, sampleTag + "_crop_gap" + mt.to * SC + "_piece" + mt.from * SC);
+
+  // 5. 拖拽起点：滑块中心 → secsdk 节点 → 退路坐标
+  let startX, startY;
+  let dragB = null;
+  if (dragNode) { try { dragB = dragNode.bounds(); } catch (e) {} }
+  if (track && track.handleRight > 0) {
+    // 滑块右沿往左退 0.6 个滑条高度 ≈ 滑块中心（左边可能和容器白边连在一起，所以从右沿算）
+    startX = cb.left + Math.round((track.handleRight - (track.bottom - track.top) * 0.6) * SC);
+    startY = cb.top + Math.round((track.top + track.bottom) / 2 * SC);
+  } else if (dragB && dragB.width() > 0) {
+    startX = dragB.centerX();
+    startY = dragB.centerY();
+  } else {
+    startX = cb.left + Math.round(pW * 0.05);
+    startY = cb.top + Math.round(pH * 0.85);
+  }
+  let endX = startX + dist;
+  if (endX > cb.right - 5) endX = cb.right - 5;
+  log("自动求解 第" + attempt + "次：缺口 x=" + mt.to * SC + " 拼图块 x=" + mt.from * SC + " 距离=" + dist + " 相关=" + mt.score.toFixed(2) +
+      (track ? "" : " 没找到滑条") + "；用时 截图 " + (tShot - t0) + " / 灰度 " + (tGray - tShot) + " / 滑条 " + (tTrack - tGray) +
+      " / 边缘+匹配 " + (tMatch - tTrack) + " / 合计 " + (Date.now() - t0) + " ms");
+  if (dist <= 0 || endX <= startX) { log("自动求解：拖动距离不对（" + dist + "），跳过"); return "fail"; }
+
+  // 6. 拖动：人手形状的变速轨迹（v4.14 2.28，见 humanDrag）。API 不可用时退回 gesture() 匀速直线
+  let hd = null;
+  try { hd = humanDrag(startX, startY, dist); } catch (e) { if (isInterrupt(e)) throw e; log("自动求解：humanDrag 出错 " + e); hd = null; }
+  if (hd && hd.ok) {
+    log("自动求解 第" + attempt + "次：拖拽 (" + startX + "," + startY + ") → (" + (startX + dist + hd.bias) + "," + (startY + hd.drift) + ")" +
+        " 人手轨迹 计划=" + hd.dur + "ms 实际=" + hd.real + "ms 段数=" + hd.n + " bias=" + hd.bias + " 漂移=" + hd.drift + " 各阶段=" + hd.segs);
+  } else {
+    log("自动求解 第" + attempt + "次：人手轨迹不可用（" + (hd ? (hd.cancelled ? "第 " + (hd.failSeg + 1) + " 段手势被取消" : "第 " + (hd.failSeg + 1) + " 段 dispatch 返回 false") : "API 不可用") + "），退回 gesture()");
+    let dur = random(1200, 1800), steps = Math.round(dur / 16), pts = [];
+    for (let i = 0; i <= steps; i++) pts.push([Math.round(startX + dist * i / steps), startY]);
+    log("自动求解 第" + attempt + "次：拖拽 (" + startX + "," + startY + ") → (" + endX + "," + startY + ") 匀速");
+    try { gesture.apply(null, [dur].concat(pts)); } catch (e) { log("自动求解：gesture 失败 " + e); return "fail"; }
+  }
+  autoSolveTimes.push(Date.now());
+
+  // 7. 等结果：验证框消失 = 成功；滑块弹回起点 = TikTok 换了新图（本次失败，可以马上再试）；最多等 8 秒
+  let tr0 = trk0 || track, td = Date.now(), shot = false;
+  while (Date.now() - td < 8000) {
+    sleep(400);
+    if (!overlaySuspect()) { log("自动求解 第" + attempt + "次：成功，验证框已消失（拖完 " + (Date.now() - td) + "ms）"); return "ok"; }
+    let snap = null; try { snap = cropScreen(cb); } catch (e) {}
+    if (!shot && Date.now() - td >= 800) { shot = true; saveSample(snap, sampleTag + "_after"); }
+    if (snap && tr0.handleRight > 0 && Date.now() - td >= 1000) {
+      let g2 = bmpToGray(android.graphics.Bitmap.createScaledBitmap(snap, sw, sh, true));
+      if (handleAtStart(g2, tr0)) {
+        saveSample(snap, sampleTag + "_newpuzzle");
+        // 被拒的话 TikTok 先转圈、再显示 "Unable to verify"，滑块至少 3 秒后才回到起点；拖完不到 2.5 秒滑块就在起点 = 拖动根本没生效
+        if (Date.now() - td < 2500) { log("自动求解 第" + attempt + "次：拖动没生效，滑块一直在起点（拖完 " + (Date.now() - td) + "ms）"); lastTrack = tr0; return "retry"; }
+        log("自动求解 第" + attempt + "次：被拒，滑块弹回、换了新图（拖完 " + (Date.now() - td) + "ms）");
+        lastTrack = tr0;
+        return "retry";
+      }
+    }
+  }
+  log("自动求解 第" + attempt + "次：等了 8 秒，验证框还在、滑块也没弹回");
+  return "fail";
+}
+
+// humanDrag(x0, y0, dist) —— 人手形状的拖动（v4.14 2.28，依据 cheat sheet §7）：
+// 按下停一下 → 慢慢起步到 20–30% → 犹豫 2–4 像素 → 快速“甩”到 85–92%（峰值速度约为起步的 5–7 倍）→ 减速落到 dist+bias（略过缺口，不拉回）→ 停一下松手。
+// 实现：把这条曲线按 20–30ms 采样成几十段，每段单独 dispatchGesture，用 StrokeDescription.continueStroke 接成一次连续触摸。
+// 为什么这么做：① AutoX 的 gesture() 只有一段，安卓按恒定速度回放，变速全丢；② 安卓对无障碍手势每 100ms 才采样一个触摸事件，
+//   1.4 秒的拖动只有 15 个事件（真人每秒 60 个以上），而每段的结束点一定会发一个事件，所以段切得细事件才密；
+//   ③ 同一个 GestureDescription 里的多条 stroke 会被当成多指同时触摸（09:43 实测 TikTok 完全没收到拖动），必须一段一个 dispatch。
+// 纵向：整条轨迹单方向平滑漂移 4–14 像素，按时间均匀分布，没有逐点抖动。
+// 返回 { ok, cancelled, dur(计划), real(实际), n(段数), bias, drift, segs(各阶段毫秒) }；API 不可用返回 null（调用方退回 gesture()）
+function humanDrag(x0, y0, dist) {
+  let GD = android.accessibilityservice.GestureDescription;
+  let svc = auto.service;
+  if (!svc || !GD) return null;
+  let bias = random(1, 4);
+  let drift = random(4, 14) * (Math.random() < 0.5 ? -1 : 1);
+  let total = dist + bias;
+  let f1 = 0.2 + Math.random() * 0.1, f3 = 0.85 + Math.random() * 0.07, hes = random(2, 4) / total;
+  // 各阶段时长 ms：按下 / 慢起步 / 犹豫 / 快甩 / 减速落下 / 停一下
+  let ph = [random(90, 220), random(300, 500), random(60, 150), random(110, 200), random(180, 350), random(40, 120)];
+  let T = 0; ph.forEach((d) => { T += d; });
+  let ei = (u) => u * u, eo = (u) => 1 - (1 - u) * (1 - u), eio = (u) => u * u * (3 - 2 * u);
+  // 距离比例 f(t)，t 为毫秒
+  let fx = (t) => {
+    let a = 0;
+    if (t < (a += ph[0])) return 0;                                          // 按下
+    if (t < a + ph[1]) return f1 * ei((t - a) / ph[1]); a += ph[1];           // 慢起步（加速）
+    if (t < a + ph[2]) return f1 + hes * eio((t - a) / ph[2]); a += ph[2];    // 犹豫
+    if (t < a + ph[3]) return f1 + hes + (f3 - f1 - hes) * eio((t - a) / ph[3]); a += ph[3]; // 快甩
+    if (t < a + ph[4]) return f3 + (1 - f3) * eo((t - a) / ph[4]);           // 减速落下
+    return 1;                                                                // 停一下
+  };
+  // 按真实时间采样：每段计划 12–18ms，但每次 dispatch 有约 35–40ms 的系统开销（09:50 实测），
+  // 所以下一段的目标位置用实际已过去的时间去算，轨迹在墙上时钟里保持原来的形状，事件间隔约 50ms（≈20 个/秒，这个 API 的上限）
+  let pt = (t) => [Math.round(x0 + total * fx(t)), Math.round(y0 + drift * Math.min(1, t / T))];
+  let res = { ok: false, cancelled: false, dur: T, real: 0, n: 0, bias: bias, drift: drift, segs: ph.join("/"), failSeg: -1 };
+  let prev = null, tStart = Date.now(), p0 = pt(0), more = true;
+  while (more) {
+    let now = Date.now() - tStart, d = random(12, 18), tn = now + d;
+    if (tn >= T) { tn = T; more = false; }
+    let p1 = pt(tn);
+    if (p1[0] === p0[0] && p1[1] === p0[1]) p1 = [p1[0], p1[1] + (drift > 0 ? 1 : -1)]; // 零长度路径不保险，给 1 像素纵向位移
+    let p = new android.graphics.Path();
+    p.moveTo(p0[0], p0[1]); p.lineTo(p1[0], p1[1]); // 接续的一段必须从上一段实际的终点开始，否则系统会取消手势
+    let st = prev ? prev.continueStroke(p, 0, d, more) : new GD.StrokeDescription(p, 0, d, more);
+    let b = new GD.Builder(); b.addStroke(st);
+    let done = { v: 0 };
+    let cb = new android.accessibilityservice.AccessibilityService.GestureResultCallback({
+      onCompleted: function (g) { done.v = 1; },
+      onCancelled: function (g) { done.v = 2; },
+    });
+    if (!svc.dispatchGesture(b.build(), cb, null)) { res.failSeg = res.n; return res; }
+    let tw = Date.now();
+    while (!done.v && Date.now() - tw < d + 1000) sleep(2);
+    if (done.v === 2) { res.cancelled = true; res.failSeg = res.n; return res; }
+    prev = st; p0 = p1; res.n++;
+  }
+  res.real = Date.now() - tStart;
+  res.ok = true;
+  return res;
+}
+
+// findTrack(gray) —— 在下半部分找滑条：一段连续的行，每行中段像素的中位数是浅灰（236–249）。
+// 中间的提示文字会让几行不达标，所以相隔 ≤ 8 行的段落合并（但不跨过整行发白的行）。返回 { top, bottom, handleRight }（缩小后的坐标）；找不到返回 null
+// handleRight = 滑条靠上 15% 那一行里，左侧 45% 范围内最右边的白点（≥ 250）= 滑块右沿
+function findTrack(gray) {
+  let d = gray.data, w = gray.w, h = gray.h;
+  let x0 = Math.round(w * 0.3), x1 = Math.round(w * 0.95);
+  let runs = [], cur = null;
+  for (let y = Math.round(h * 0.6); y < h; y++) {
+    // 中位数在 236–249 ⇔ 低于 236 的不到一半、高于 249 的也不到一半（计数代替排序，v4.13 提速）
+    let lo = 0, hi = 0, half = (x1 - x0) / 4; // 隔一个像素取一个（提速），所以一半 = 总数 / 4
+    for (let x = x0; x < x1; x += 2) { let v = d[y * w + x]; if (v < 236) lo++; else if (v > 249) hi++; }
+    if (lo < half && hi < half) {
+      if (cur && y - cur.bottom <= 8) cur.bottom = y;
+      else { cur = { top: y, bottom: y }; runs.push(cur); }
+    } else if (hi >= half) cur = null; // 整行发白（滑条和图片之间的白边）就断开，只跨过滑条里的提示文字那几行
+  }
+  let best = null;
+  runs.forEach((t) => { if (!best || t.bottom - t.top > best.bottom - best.top) best = t; });
+  if (!best || best.bottom - best.top < 5) return null;
+  let ry = best.top + Math.round((best.bottom - best.top) * 0.15);
+  // 取最右边的白点：容器白边和滑块之间隔着一两列滑条灰，不能遇到灰就停
+  let right = -1;
+  for (let x = 0; x < Math.round(w * 0.45); x++) if (d[ry * w + x] >= 250) right = x;
+  best.handleRight = right;
+  return best;
+}
+
+// handleAtStart(gray, tr) —— 滑块是否在起点：tr（第 1 次看到的滑条）滑块右沿左边一段是白的（≥ 250），右边一段是滑条原来的浅灰（236–249）。
+// 拖过以后滑块左边会变成绿色（灰度约 223），显示“Unable to verify”时滑块还停在终点，都不算
+function handleAtStart(gray, tr) {
+  let d = gray.data, w = gray.w;
+  let ry = tr.top + Math.round((tr.bottom - tr.top) * 0.15), hr = tr.handleRight;
+  let white = 0, grey = 0;
+  for (let x = hr - 12; x <= hr - 1; x++) if (x >= 0 && d[ry * w + x] >= 250) white++;
+  for (let x = hr + 3; x <= hr + 10; x++) { let v = d[ry * w + x]; if (v >= 236 && v <= 249) grey++; }
+  return white >= 10 && grey >= 7;
+}
+
+// matchPiece(gray, y0, y1) —— 只匹配拼图块轮廓（v4.12 2.26）：
+// 1) 图片左边框 L = 左侧 15% 里最强的竖向边缘列；拼图块左沿 xp = L 右侧 12% 里最强的列
+// 2) xp 这一列上有边缘的行 = 拼图块上下沿（中间凹口会断开，相隔 ≤ 15 行的合并，取最长一段）
+// 3) 拼图块近似正方形：模板 = 这几行、从 xp 起宽 = 高 的一段，在同样的行里往右滑，归一化相关最大处就是缺口
+// 返回 { from, to }，拖动距离 = to − from。只用拼图块那几行，图片里别处的树枝、云不会干扰
+function matchPiece(gray, y0, y1) {
+  let w = gray.w, E = new Array(w * gray.h).fill(0);
+  let xl = Math.round(w * 0.3);
+  sobelRect(gray, E, 1, xl + 1, y0, y1); // 先只算左边 30%：够找图片左边框和拼图块
+  let cs = new Array(w).fill(0);
+  for (let y = y0; y <= y1; y++) for (let x = 0; x <= xl; x++) cs[x] += E[y * w + x];
+  let L = 0, lim = Math.round(w * 0.15);
+  for (let x = 0; x <= lim; x++) if (cs[x] > cs[L]) L = x;
+  let xp = L + 3, lim2 = L + Math.round(w * 0.12);
+  for (let x = L + 3; x <= lim2; x++) if (cs[x] > cs[xp]) xp = x;
+  let ev = [], mx = 0;
+  for (let y = y0; y <= y1; y++) {
+    let v = Math.max(E[y * w + xp - 1], E[y * w + xp], E[y * w + xp + 1]);
+    ev.push(v); if (v > mx) mx = v;
+  }
+  let runs = [], cur = null;
+  for (let i = 0; i < ev.length; i++) {
+    if (ev[i] < mx * 0.4) continue;
+    let y = y0 + i;
+    if (cur && y - cur.b <= 15) cur.b = y; else { cur = { t: y, b: y }; runs.push(cur); }
+  }
+  let best = null;
+  runs.forEach((r) => { if (!best || r.b - r.t > best.b - best.t) best = r; });
+  if (!best) return null;
+  let top = Math.max(y0, best.t - 2), bot = Math.min(y1, best.b + 2), ph = best.b - best.t;
+  sobelRect(gray, E, 1, w - 2, top, bot); // 再只对拼图块那几行算全宽
+  let t0 = Math.max(0, xp - 2), k = ph + 5;
+  // 粗搜：把拼图块那几行的边缘图再 2×2 合并（缩小一半），在所有位置上算二维 ZNCC；
+  // 再在粗搜前 3 名附近 ±2 列用原分辨率细算，取最高。（原来先用一维轮廓挑候选，倒影、树枝多的图会把真缺口筛掉：
+  // 08:03 那张湖面图拖了 372，应约 190）
+  let h2 = Math.floor((bot - top + 1) / 2), w2 = Math.floor(w / 2);
+  let Q = new Array(w2 * h2);
+  for (let y = 0; y < h2; y++) {
+    let r0 = (top + 2 * y) * w, r1 = r0 + w;
+    for (let x = 0; x < w2; x++) Q[y * w2 + x] = E[r0 + 2 * x] + E[r0 + 2 * x + 1] + E[r1 + 2 * x] + E[r1 + 2 * x + 1];
+  }
+  let k2 = Math.ceil(k / 2), c0 = Math.floor(t0 / 2), coarse = [];
+  for (let x = Math.ceil((xp + ph) / 2); x + k2 < w2 - 1; x++) coarse.push([x, zncc(Q, w2, c0, x, k2, 0, h2 - 1)]);
+  let peaks = [];
+  for (let i = 0; i < coarse.length; i++) {
+    if ((i === 0 || coarse[i][1] >= coarse[i - 1][1]) && (i === coarse.length - 1 || coarse[i][1] >= coarse[i + 1][1])) peaks.push(coarse[i]);
+  }
+  peaks.sort((p, q) => q[1] - p[1]);
+  let tried = {}, bx = -1, bs = -2;
+  peaks.slice(0, 3).forEach((pk) => {
+    for (let dx = -2; dx <= 3; dx++) {
+      let x = pk[0] * 2 + dx;
+      if (x < xp + ph || x + k >= w - 2 || tried[x]) continue;
+      tried[x] = 1;
+      let z = zncc(E, w, t0, x, k, top, bot);
+      if (z > bs) { bs = z; bx = x; }
+    }
+  });
+  return bx < 0 ? null : { from: t0, to: bx, score: bs };
+}
+// zncc —— 模板（列 t0 起宽 k）和候选（列 x 起宽 k）在 top–bot 行上的零均值归一化相关，−1 到 1
+function zncc(E, w, t0, x, k, top, bot) {
+  let mt = 0, mi = 0, c = 0;
+  for (let y = top; y <= bot; y++) { let r = y * w; for (let j = 0; j < k; j++) { mt += E[r + t0 + j]; mi += E[r + x + j]; c++; } }
+  mt /= c; mi /= c;
+  let a = 0, b = 0, d = 0;
+  for (let y = top; y <= bot; y++) {
+    let r = y * w;
+    for (let j = 0; j < k; j++) { let T = E[r + t0 + j] - mt, I = E[r + x + j] - mi; a += T * I; b += T * T; d += I * I; }
+  }
+  return b && d ? a / Math.sqrt(b * d) : 0;
+}
+// ======== 自动滑块求解 END ========
+
 // countIt = 这是不是一次确认的验证窗口（算进“5 分钟内 3 次”）；行为触发（卡片连续没弹出、翻页没反应）不算
 function handleVerify(why, countIt) {
   let now = Date.now();
@@ -1185,14 +1582,29 @@ function handleVerify(why, countIt) {
     haltWith("vfreq", "5 分钟内出现 " + n + " 次验证窗口");
     return;
   }
-  setState("recover", "验证窗口，按返回"); // 先自动处理，保持绿色
+  setState("recover", "验证窗口，尝试自动求解"); // 先自动处理，保持绿色
+
+  // ---- 第一步：机端自动滑块求解 ----
+  if (CFG.autoSolveEnabled) {
+    log("验证窗口：尝试自动滑块求解");
+    showTip("尝试自动滑块求解…");
+    let solveResult = autoSolveCaptcha();
+    if (solveResult === "ok") {
+      showTip("自动求解成功"); setState("run");
+      log("自动求解成功，验证框已消失");
+      return;
+    }
+    log("自动求解结果：" + solveResult + "，回退到按返回流程");
+  }
+
+  // ---- 第二步：按返回关掉验证框 ----
   back(); sleep(random(1500, 2500));
   if (!overlaySuspect()) { showTip("已关闭验证窗口"); setState("run"); log("按返回关掉了验证窗口"); return; }
   log("按返回没关掉，重启 TikTok");
   stopTikTok(); app.launch(targetPkg); sleep(7000);
   enterLiveCounted("重启后");
   if (!overlaySuspect()) { showTip("已关闭验证窗口"); setState("run"); log("重启 TikTok 后验证窗口消失"); return; }
-  haltWith("halt", "按返回和重启 TikTok 都没能关掉验证窗口");
+  haltWith("halt", "自动求解 + 按返回 + 重启 TikTok 都没能关掉验证窗口");
 }
 // 需验证状态下，用户处理完不点 ▶，检测到弹窗消失也自动继续（“验证太频繁”不自动继续，要让账号休息）
 function watchResume() {
