@@ -3,7 +3,7 @@
 // 注意：全文只用 let，不要用 const。AutoX 的 Rhino 引擎里，循环体内的 const 只会赋值一次，
 // 之后每轮都保留第一次的值（实测：每个直播间都记成第一个用户名、找卡片一直超时）
 // 版本号：热更新加载器靠这个标记判断下载内容是否有效，悬浮窗也会显示。每次推送加 0.1
-let SCRIPT_VERSION = "1.4"; // 新增：机端图像分析 + 自动滑块求解（Sobel 边缘检测，Android Bitmap API）
+let SCRIPT_VERSION = "1.4.1"; // 修复：“进不了直播”后手动进了直播间也不自动继续；直播间判断加通用识别兜底
 
 auto.waitFor();
 
@@ -162,6 +162,9 @@ function headerNick(h) {
 }
 
 let anyHeader = (timeout) => (idMode ? roomHeader(timeout) : genericHeader(timeout));
+// 只判断“现在在不在直播间”（不抓）：ID 顶部条找不到再用通用识别兜底。
+// ID 顶部条加载慢、被礼物动画挡住、或者 ID 变了时，只看 ID 会把直播间误判成“没进去”（客户反馈 v1.4.1）
+let inLive = (timeout) => roomHeader(timeout) || genericHeader(800);
 
 function textKeys() {
   let st = new Set();
@@ -242,7 +245,7 @@ function onHomeFeed() {
 // 在首页点左上角 LIVE 入口进入直播流；返回是否已进入直播间
 function enterLive() {
   for (let i = 0; i < 4; i++) {
-    if (anyHeader(1000)) return true;
+    if (inLive(2500)) return true; // 多等一会：只等 1 秒会把还在加载的直播间当成“不在直播间”按返回退掉
     let entry = className("android.widget.ImageView").clickable(true)
       .boundsInside(0, 0, Math.round(W * 0.2), Math.round(H * 0.13)).findOne(1000);
     let onHome = onHomeFeed();
@@ -258,7 +261,7 @@ function enterLive() {
     }
     sleep(4000);
   }
-  return !!anyHeader(1500);
+  return !!inLive(1500);
 }
 
 // 进入 LIVE，并统计“连续进不了直播间”的次数（网络正常时连续 CFG.liveFailLimit 次就暂停，见主循环）
@@ -509,8 +512,8 @@ let ALERT = {
   halt: { t: "需验证", h: "TikTok 弹出了验证窗口。请在屏幕上完成验证，然后点 ▶ 继续。" },
   vpn: { t: "VPN 断开", h: "TikTok 连不上。请打开 VPN 并连接，连上后会自动继续。", btn: "重试" },
   nonet: { t: "无网络", h: "手机没有联网。请打开 Wi-Fi 或流量，恢复后会自动继续。", btn: "重试" },
-  nolive: { t: "进不了直播", h: "网络正常，但连续 3 次进不了直播间。请手动打开 TikTok 的 LIVE 页面，然后点 ▶ 继续。" },
-  notk: { t: "进不了直播", h: "TikTok 没能重新打开。请手动打开 TikTok 的 LIVE 页面，然后点 ▶ 继续。" },
+  nolive: { t: "进不了直播", h: "网络正常，但连续 3 次进不了直播间。请手动打开 TikTok 的 LIVE 页面，进入直播间后会自动继续（也可以点 ▶）。" },
+  notk: { t: "进不了直播", h: "TikTok 没能重新打开。请手动打开 TikTok 的 LIVE 页面，进入直播间后会自动继续（也可以点 ▶）。" },
   vfreq: { t: "验证太频繁", h: "TikTok 频繁弹出验证，继续跑容易被限制。建议先休息 10–30 分钟，或者手动完成验证后点 ▶ 继续。" },
   noacc: { t: "无障碍关闭", h: "系统关掉了「主播采集」的无障碍权限，程序没法操作 TikTok。", btn: "去设置打开" },
 };
@@ -1130,13 +1133,13 @@ function backoff() {
   log("退避：按返回");
   back();
   sleep(random(1500, 2500));
-  if (anyHeader(2500)) return true;
+  if (inLive(2500)) return true;
   log("退避：还不是直播间，强制关闭并重启 TikTok");
   stopTikTok();
   app.launch(targetPkg);
   sleep(7000);
   if (enterLive()) return true;
-  return !!anyHeader(3000);
+  return !!inLive(3000);
 }
 
 // ---------------- 验证窗口识别（2.18，v4.8 补充） ----------------
@@ -1606,12 +1609,13 @@ function handleVerify(why, countIt) {
   if (!overlaySuspect()) { showTip("已关闭验证窗口"); setState("run"); log("重启 TikTok 后验证窗口消失"); return; }
   haltWith("halt", "自动求解 + 按返回 + 重启 TikTok 都没能关掉验证窗口");
 }
-// 需验证状态下，用户处理完不点 ▶，检测到弹窗消失也自动继续（“验证太频繁”不自动继续，要让账号休息）
+// 需验证 / 进不了直播 / TikTok 未打开 状态下，用户处理完不点 ▶，检测到已回到直播间也自动继续
+// （“验证太频繁”不自动继续，要让账号休息）
 function watchResume() {
   try {
-    if (curPkg() !== targetPkg || overlaySuspect() || !anyHeader(800)) return;
-    log("验证窗口已消失，自动继续");
-    verifyTimes = []; backoffFailTimes = []; nonLive = 0; cardMiss = 0; stuck = 0;
+    if (curPkg() !== targetPkg || overlaySuspect() || !inLive(800)) return;
+    log((uiState === "halt" ? "验证窗口已消失" : "已回到直播间") + "，自动继续");
+    verifyTimes = []; backoffFailTimes = []; nonLive = 0; cardMiss = 0; stuck = 0; liveFails = 0; relaunchFails = 0;
     running = true; setState("run");
   } catch (e) { if (isInterrupt(e)) throw e; }
 }
@@ -1635,6 +1639,13 @@ function netGate(why) {
   ensureNet(why, ns);
   return true;
 }
+// 变红“进不了直播”之前再看一眼：页面可能在最后一次检查之后才加载出来，其实已在直播间就不暂停
+function stillInLive() {
+  if (curPkg() !== targetPkg || !inLive(1500)) return false;
+  log("其实已在直播间，不暂停");
+  liveFails = 0; backoffFailTimes = []; nonLive = 0; setState("run");
+  return true;
+}
 // 退避没能回到直播间的计数（含“不在直播间”）：10 分钟内 3 次 → 红色“进不了直播”
 function noteBackoffFail(why) {
   let now = Date.now();
@@ -1643,6 +1654,7 @@ function noteBackoffFail(why) {
   log("没能回到直播间（" + backoffFailTimes.length + "/" + CFG.backoffFails + "）：" + why);
   if (backoffFailTimes.length >= CFG.backoffFails) {
     backoffFailTimes = [];
+    if (stillInLive()) return false;
     haltWith("nolive", CFG.backoffWindowMs / 60000 + " 分钟内 " + CFG.backoffFails + " 次都没能回到直播间");
     return true;
   }
@@ -1680,7 +1692,7 @@ threads.start(function () {
   while (!stopped) {
     if (!isCurrent()) { log("发现新启动的实例，本实例退出"); break; }
     if (!running) {
-      if (uiState === "halt" && Date.now() - lastWatch > 3000) { lastWatch = Date.now(); watchResume(); }
+      if ((uiState === "halt" || uiState === "nolive" || uiState === "notk") && Date.now() - lastWatch > 3000) { lastWatch = Date.now(); watchResume(); }
       sleep(500); continue;
     }
     if (ring.mode === "idle") startCycle(5500);
@@ -1694,6 +1706,7 @@ threads.start(function () {
     // 连续进不了直播间：网络有问题走断网流程；网络正常就暂停，请人手动打开 LIVE
     if (liveFails >= CFG.liveFailLimit) {
       liveFails = 0;
+      if (stillInLive()) continue;
       let ns = netState();
       if (ns !== "ok") ensureNet("连续进不了直播间", ns);
       else haltWith("nolive", "网络正常，但连续 " + CFG.liveFailLimit + " 次进不了直播间");
