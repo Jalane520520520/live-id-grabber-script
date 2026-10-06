@@ -3,7 +3,7 @@
 // 注意：全文只用 let，不要用 const。AutoX 的 Rhino 引擎里，循环体内的 const 只会赋值一次，
 // 之后每轮都保留第一次的值（实测：每个直播间都记成第一个用户名、找卡片一直超时）
 // 版本号：热更新加载器靠这个标记判断下载内容是否有效，悬浮窗也会显示。每次推送加 0.1
-let SCRIPT_VERSION = "1.4.1"; // 修复：“进不了直播”后手动进了直播间也不自动继续；直播间判断加通用识别兜底
+let SCRIPT_VERSION = "1.4.2"; // 修复：冷启动黑屏时不再过早按返回，给足 12 秒加载时间
 
 auto.waitFor();
 
@@ -244,25 +244,110 @@ function onHomeFeed() {
 
 // 在首页点左上角 LIVE 入口进入直播流；返回是否已进入直播间
 function enterLive() {
-  for (let i = 0; i < 4; i++) {
-    if (inLive(2500)) return true; // 多等一会：只等 1 秒会把还在加载的直播间当成“不在直播间”按返回退掉
-    let entry = className("android.widget.ImageView").clickable(true)
-      .boundsInside(0, 0, Math.round(W * 0.2), Math.round(H * 0.13)).findOne(1000);
-    let onHome = onHomeFeed();
-    if (entry && onHome) {
-      log("在首页，点 LIVE 入口");
-      entry.click() || press(entry.bounds().centerX(), entry.bounds().centerY(), 60);
-    } else if (onHome || desc("Home").exists() || text("Home").exists()) {
-      log("在首页，按坐标点 LIVE 入口");
-      click.apply(null, px(CFG.liveEntryFallback[0], CFG.liveEntryFallback[1]));
-    } else {
-      log("不在首页也不在直播间，按返回");
-      back();
-    }
-    sleep(4000);
+  // 决定等待预算：第一次调用用长等待（冷启动），之后用短等待（暖启动）
+  let waitBudget = 12000;  // 冷启动：12 秒
+  if (enterLive.hasEnteredOnce) {
+    waitBudget = 5000;  // 暖启动：5 秒
   }
-  return !!inLive(1500);
+
+  let clicked = false;  // 本轮是否已点击过 LIVE 入口
+  let backedOnce = false;  // 没点过 LIVE 时，为了关弹窗最多按一次返回
+
+  for (let i = 0; i < 4; i++) {
+    // 先检查是否已在直播间
+    if (inLive(2500)) {
+      enterLive.hasEnteredOnce = true;
+      return true;
+    }
+
+    // 确认在首页，点一次 LIVE 入口
+    if (!clicked) {
+      let entry = className("android.widget.ImageView").clickable(true)
+        .boundsInside(0, 0, Math.round(W * 0.2), Math.round(H * 0.13)).findOne(1000);
+      let onHome = onHomeFeed();
+
+      if (entry && onHome) {
+        log("在首页，点 LIVE 入口");
+        entry.click() || press(entry.bounds().centerX(), entry.bounds().centerY(), 60);
+        clicked = true;
+      } else if (onHome || desc("Home").exists() || text("Home").exists()) {
+        log("在首页，按坐标点 LIVE 入口");
+        click.apply(null, px(CFG.liveEntryFallback[0], CFG.liveEntryFallback[1]));
+        clicked = true;
+      }
+    }
+
+    // 点完后只轮询，不按返回
+    if (clicked) {
+      log("已点击 LIVE，等待直播间加载（预算 " + waitBudget + "ms）...");
+      let deadline = Date.now() + waitBudget;
+      while (Date.now() < deadline) {
+        if (inLive(500)) {
+          enterLive.hasEnteredOnce = true;
+          let elapsed = waitBudget - (deadline - Date.now());
+          log("直播间已加载，用时 " + elapsed + "ms");
+          return true;
+        }
+        sleep(500);  // 每 500ms 检查一次
+      }
+
+      // 超时后只在确认是首页时才按返回
+      log("等待 " + waitBudget + "ms 后仍未进入直播间");
+
+      // 用 fresh 确保是真正在屏幕上的节点，不是无障碍缓存
+      let freshHome = text("For You").findOnce() || desc("For You").findOnce() ||
+                      text("推荐").findOnce() || text("Dành cho bạn").findOnce() ||
+                      desc("Dành cho bạn").findOnce();
+      if (freshHome && onScreen(freshHome)) {
+        log("确认在首页，按返回");
+        back();
+        sleep(1500);
+      } else {
+        log("不在首页（可能是黑屏、登录页、验证码），不按返回");
+      }
+
+      // 已点击过一次，退出循环
+      break;
+    }
+
+    // 既不在首页也不在直播间（黑屏加载中）：不按返回，等直播间或首页出现。
+    // 冷启动的正常顺序是 启动画面 → 首页，首页出来就回到上面去点 LIVE
+    if (!clicked) {
+      log("不在首页也不在直播间，可能是黑屏加载中，耐心等待...");
+      // 还没点过 LIVE，没有正在加载的直播间，所以这里最多等 6 秒（调用前 ensureInApp / backoff 已经等过 6–7 秒）
+      let deadline = Date.now() + Math.min(waitBudget, 6000), homeShown = false;
+      while (Date.now() < deadline) {
+        if (inLive(500)) {
+          enterLive.hasEnteredOnce = true;
+          return true;
+        }
+        if (onHomeFeed()) { homeShown = true; break; }
+        sleep(500);
+      }
+      if (homeShown) continue;
+      // 还是两样都不是：多半是弹窗盖住了首页（实测冷启动后的 “Follow your friends”）。
+      // 验证窗口不按返回，交给主循环的 handleVerify（让自动求解先拖）；其他弹窗按一次返回关掉，再回去点 LIVE
+      if (overlaySuspect()) { log("等待后是验证窗口，不按返回，交给验证流程"); break; }
+      if (!backedOnce) {
+        backedOnce = true;
+        log("可能有弹窗挡住，按一次返回");
+        back();
+        sleep(1500);
+        continue;
+      }
+      log("等待后仍然不在直播间");
+      break;
+    }
+  }
+
+  // 最后确认
+  let finalCheck = inLive(1500);
+  if (finalCheck) enterLive.hasEnteredOnce = true;
+  return finalCheck;
 }
+
+// 初始化标记
+enterLive.hasEnteredOnce = false;
 
 // 进入 LIVE，并统计“连续进不了直播间”的次数（网络正常时连续 CFG.liveFailLimit 次就暂停，见主循环）
 function enterLiveCounted(where) {
@@ -285,6 +370,7 @@ function ensureInApp() {
   if (curPkg() === targetPkg) { relaunchFails = 0; return true; }
   log("不在 TikTok（当前 " + curPkg() + "），尝试拉回");
   setState("recover", "离开了 TikTok");
+  enterLive.hasEnteredOnce = false; // 重新拉起可能是冷启动，下一次进房用长等待
   app.launch(targetPkg);
   sleep(6000);
   if (curPkg() === targetPkg) {
@@ -1124,6 +1210,7 @@ function stopTikTok() {
     try { home(); sleep(1000); context.getSystemService("activity").killBackgroundProcesses(targetPkg); sleep(1500); done = true; }
     catch (e) { if (isInterrupt(e)) throw e; log("killBackgroundProcesses 失败: " + e); }
   }
+  enterLive.hasEnteredOnce = false; // TikTok 被关掉了，接下来是冷启动，进房用长等待
   return done;
 }
 
